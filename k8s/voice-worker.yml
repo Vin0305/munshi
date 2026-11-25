@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: munshi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: voice-worker-code
+  namespace: munshi
+data:
+  worker.mjs: |
+    const rush = () => process.env.RUSH === "true";
+    let fails = 0, alerted = false, win = [];
+    async function post(url, body, headers = {}) {
+      if (!url) return;
+      try {
+        const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+        console.log(`[voice-reply] posted to ${url.slice(0, 40)}... -> ${r.status}`);
+      } catch (e) { console.error("[voice-reply] post failed", e.message); }
+    }
+    const fsHealth = (status, text) => post(process.env.FS_HEALTH_URL, {
+      feature: "voice_replies", environment: "Development", status, reason: { text_blocks: [{ text }] },
+    });
+    if (!rush()) fsHealth("healthy", "Voice replies healthy");
+    setInterval(async () => {
+      const job = `order-${Date.now()}`;
+      if (rush()) {
+        const lat = Math.round(6000 + Math.random() * 4000);
+        const fail = Math.random() < 0.6;
+        win.push(fail);
+        if (fail) { fails++; console.error(`[voice-reply] ERROR Sarvam TTS 429 Too Many Requests after ${lat}ms queue_depth=${120 + Math.floor(Math.random() * 80)} job=${job}`); }
+        else console.log(`[voice-reply] WARN slow ok ${lat}ms job=${job}`);
+      } else {
+        win.push(false); fails = 0;
+        console.log(`[voice-reply] ok ${Math.round(300 + Math.random() * 400)}ms job=${job}`);
+      }
+      win = win.slice(-20);
+      const rate = win.filter(Boolean).length / win.length;
+      if (rush() && win.length >= 10 && rate > 0.4 && !alerted) {
+        alerted = true;
+        const msg = `Voice reply error rate ${Math.round(rate * 100)}% - Sarvam TTS 429s during Diwali-eve rush`;
+        console.error(`[voice-reply] ALERT ${msg}`);
+        await post(process.env.NB_WEBHOOK_URL,
+          { alert: "VoiceReplyErrorRate", feature: "voice_replies", error_rate: rate, service: "munshi-voice-worker", namespace: "munshi", message: msg },
+          process.env.NB_WEBHOOK_SECRET ? { "X-Webhook-Secret": process.env.NB_WEBHOOK_SECRET } : {});
+        await fsHealth("unhealthy", msg);
+      }
+      if (fails >= 45) { console.error("[voice-reply] FATAL retry budget exhausted, exiting"); process.exit(1); }
+    }, 1000);
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: munshi-voice-worker
+  namespace: munshi
+  labels:
+    app: munshi-voice-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: munshi-voice-worker
+  template:
+    metadata:
+      labels:
+        app: munshi-voice-worker
+    spec:
+      containers:
+        - name: worker
+          image: node:22-alpine
+          command: ["node", "/app/worker.mjs"]
+          env:
+            - name: RUSH
+              value: "false"
+          envFrom:
+            - secretRef:
+                name: voice-worker-secrets
+                optional: true
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          volumeMounts:
+            - name: code
+              mountPath: /app
+      volumes:
+        - name: code
+          configMap:
+            name: voice-worker-code
